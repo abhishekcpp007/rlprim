@@ -23,6 +23,8 @@ pip install git+https://github.com/abhishekcpp007/rlprim   # needs a C++17 compi
 pip install rlprim                                          # once wheels are on PyPI
 ```
 
+Needs Python 3.10 or newer.
+
 ## Python
 
 ```python
@@ -46,6 +48,19 @@ sampler.update(idx, np.abs(td_errors) + 1e-6)         # after the learner step
 
 `dones[t]` means the episode ended at step t. `last_value` is the value of the state after the final step, either a scalar or one entry per env. float32 rewards give float32 results and everything else gives float64.
 
+## PyTorch
+
+The same functions with tensors in and tensors out. PyTorch isn't a dependency, so this module only loads if you already have it.
+
+```python
+from rlprim import torch as rlt
+
+adv, ret = rlt.gae(rewards, values, dones, last_value)        # tensors
+vs, pg_adv = rlt.vtrace(log_rhos, rewards, values, dones, last_value)
+```
+
+Results land on the device of the first tensor you pass. The math runs on the CPU, so CUDA and MPS tensors get copied over and back. Gradients don't flow through, which is what you want for targets.
+
 ## C++
 
 Copy `include/rlprim` into your project, or add the repo with CMake and link `rlprim::rlprim`.
@@ -68,16 +83,16 @@ Measured on an Apple Silicon Mac (arm64, Python 3.12, NumPy 2.5), best of 7 runs
 
 | Task | Baseline | Baseline time | rlprim | Speedup |
 |---|---|---:|---:|---:|
-| GAE, 2048 steps x 1 env | NumPy loop over steps | 7.69 ms | 8.4 us | 920x |
-| GAE, 2048 steps x 8 envs | NumPy loop over steps | 9.03 ms | 13.0 us | 692x |
-| GAE, 128 steps x 64 envs | NumPy loop over steps | 492.4 us | 3.1 us | 161x |
-| GAE, 128 steps x 4096 envs | NumPy loop over steps | 1.32 ms | 188.4 us | 7.0x |
-| 3-step returns, 2048 x 8 | NumPy, n array passes | 386.7 us | 44.1 us | 8.8x |
-| 20-step returns, 2048 x 8 | NumPy, n array passes | 2.28 ms | 40.0 us | 57x |
-| PER sample, batch 256, 100k slots | pure-Python sum tree | 1.02 ms | 21.9 us | 47x |
-| PER update, batch 256, 100k slots | pure-Python sum tree | 985.7 us | 21.9 us | 45x |
-| PER sample, batch 256, 100k slots | `rng.choice(p=...)` | 1.07 ms | 21.9 us | 49x |
-| PER sample, batch 256, 1M slots | `rng.choice(p=...)` | 9.29 ms | 31.8 us | 292x |
+| GAE, 2048 steps x 1 env | NumPy loop over steps | 7.73 ms | 8.2 us | 941x |
+| GAE, 2048 steps x 8 envs | NumPy loop over steps | 7.80 ms | 11.2 us | 696x |
+| GAE, 128 steps x 64 envs | NumPy loop over steps | 484.8 us | 3.0 us | 162x |
+| GAE, 128 steps x 4096 envs | NumPy loop over steps | 1.13 ms | 158.5 us | 7.1x |
+| 3-step returns, 2048 x 8 | NumPy, n array passes | 372.0 us | 28.9 us | 13x |
+| 20-step returns, 2048 x 8 | NumPy, n array passes | 2.07 ms | 29.2 us | 71x |
+| PER sample, batch 256, 100k slots | pure-Python sum tree | 844.5 us | 21.2 us | 40x |
+| PER update, batch 256, 100k slots | pure-Python sum tree | 734.2 us | 21.2 us | 35x |
+| PER sample, batch 256, 100k slots | `rng.choice(p=...)` | 939.2 us | 21.2 us | 44x |
+| PER sample, batch 256, 1M slots | `rng.choice(p=...)` | 9.09 ms | 28.1 us | 324x |
 
 Read these honestly. The GAE baseline is the per-step NumPy loop from typical PPO code, so the gap is biggest when you have few envs and Python overhead dominates. With thousands of envs NumPy is already doing real work per step and the gap shrinks to single digits. No GPU baseline is included yet, and V-trace and Retrace have no benchmark yet. Timings move by 10 to 30 percent between runs on a laptop.
 
@@ -107,7 +122,7 @@ cmake -S . -B build -DRLPRIM_BUILD_TESTS=ON && cmake --build build && ctest --te
 
 - The sum tree recomputes each parent from its two children on update. Trees that push a delta up to the root pile up rounding error over many updates, and this one doesn't.
 - `find` never returns an empty slot, even when rounding pushes the lookup past the last filled leaf.
-- `nstep_returns` slides one window backward per env. It keeps the running sum in double so float32 rollouts don't pick up error from the subtraction.
+- `nstep_returns` slides one window backward per env and walks memory row by row. It keeps the running sum in double so float32 rollouts don't pick up error from the subtraction.
 - The GIL is released inside the return estimators.
 - V-trace and Retrace take log importance ratios, the form your policy network already gives you.
 

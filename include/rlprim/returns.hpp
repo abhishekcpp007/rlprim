@@ -78,8 +78,8 @@ void discounted_returns(const T* RLPRIM_RESTRICT rewards, const std::uint8_t* RL
 // where k is n, shortened by an episode end (no bootstrap then) or by the end
 // of the rollout (bootstrap from last_values).
 //
-// Runs in O(steps) per env, not O(steps * n): the window sum slides backward
-// and drops one reward when it grows past n. The running sum is kept in
+// Runs in O(steps * envs), not O(steps * envs * n): each env's window sum
+// slides backward and drops one reward when it grows past n. The running sum is kept in
 // double so the subtraction doesn't drift for float32 inputs.
 template <class T>
 void nstep_returns(const T* rewards, const T* values, const std::uint8_t* dones,
@@ -91,28 +91,39 @@ void nstep_returns(const T* rewards, const T* values, const std::uint8_t* dones,
   gpow[0] = 1.0;
   for (std::size_t k = 1; k <= n; ++k) gpow[k] = gpow[k - 1] * g;
 
-  for (std::size_t e = 0; e < envs; ++e) {
-    double window = 0.0;      // discounted reward sum over [t, end)
-    std::size_t end = steps;  // exclusive end of the window
-    for (std::size_t t = steps; t-- > 0;) {
-      const double r = static_cast<double>(rewards[t * envs + e]);
-      if (dones[t * envs + e]) {
-        window = r;
-        end = t + 1;
-      } else if (end - t > n) {
-        // window [t+1, end) already holds n rewards: drop the one at t + n
-        window = r + g * (window - gpow[n - 1] * static_cast<double>(rewards[(t + n) * envs + e]));
-        end = t + n;
-      } else {
-        window = r + g * window;
-      }
-      double ret = window;
-      if (!dones[(end - 1) * envs + e]) {
-        const double boot = (end == steps) ? static_cast<double>(last_values[e])
-                                           : static_cast<double>(values[end * envs + e]);
-        ret += gpow[end - t] * boot;
-      }
-      out[t * envs + e] = static_cast<T>(ret);
+  // Per-env window state, walked row by row so memory access stays sequential.
+  // The inner loop is branch-free: each of the three cases (episode end,
+  // window full, window still growing) is picked with selects.
+  std::vector<double> window_buf(envs, 0.0);     // discounted reward sum over [t, end)
+  std::vector<std::size_t> end_buf(envs, steps);  // exclusive end of the window
+  std::vector<double> open_buf(envs, 1.0);        // 0 when the window stops at an episode end
+  double* RLPRIM_RESTRICT window = window_buf.data();
+  std::size_t* RLPRIM_RESTRICT end = end_buf.data();
+  double* RLPRIM_RESTRICT open = open_buf.data();
+  const double* RLPRIM_RESTRICT gp = gpow.data();
+  const double gdrop = gpow[n - 1];
+
+  for (std::size_t t = steps; t-- > 0;) {
+    const T* r = rewards + t * envs;
+    const std::uint8_t* d = dones + t * envs;
+    // when t + n is past the rollout no window can be full, so any valid row works
+    const T* dropped = (t + n < steps) ? rewards + (t + n) * envs : r;
+    T* o = out + t * envs;
+    for (std::size_t e = 0; e < envs; ++e) {
+      const bool done = d[e] != 0;
+      const std::size_t en = end[e];
+      const bool full = !done && (en - t > n);
+      const double re = static_cast<double>(r[e]);
+      const double sub = full ? gdrop * static_cast<double>(dropped[e]) : 0.0;
+      const double w = re + (done ? 0.0 : g) * (window[e] - sub);
+      const std::size_t en2 = done ? t + 1 : (full ? t + n : en);
+      const double op = done ? 0.0 : (full ? 1.0 : open[e]);
+      window[e] = w;
+      end[e] = en2;
+      open[e] = op;
+      const double boot = (en2 == steps) ? static_cast<double>(last_values[e])
+                                         : static_cast<double>(values[en2 * envs + e]);
+      o[e] = static_cast<T>(w + op * gp[en2 - t] * boot);
     }
   }
 }
