@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+_skbuild/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.so
+*.pyd
+wheelhouse/
