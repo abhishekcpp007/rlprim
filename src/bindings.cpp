@@ -1,11 +1,13 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
 
+#include <rlprim/normalize.hpp>
 #include <rlprim/returns.hpp>
 #include <rlprim/sampler.hpp>
 #include <rlprim/sum_tree.hpp>
@@ -175,6 +177,63 @@ py::array retrace_impl(const py::object& rewards, const py::object& q_values,
   return std::move(out);
 }
 
+struct PyNorm {
+  std::vector<py::ssize_t> shape;
+  rlprim::RunningNorm core;
+};
+
+PyNorm make_norm(const py::object& shape, double epsilon) {
+  std::vector<py::ssize_t> dims;
+  if (py::isinstance<py::int_>(shape)) {
+    dims.push_back(shape.cast<py::ssize_t>());
+  } else {
+    for (auto item : py::reinterpret_borrow<py::tuple>(py::tuple(shape))) dims.push_back(item.cast<py::ssize_t>());
+  }
+  std::size_t dim = 1;
+  for (auto v : dims) {
+    if (v < 1) throw py::value_error("every dimension of shape must be >= 1");
+    dim *= static_cast<std::size_t>(v);
+  }
+  if (!(epsilon > 0.0)) throw py::value_error("epsilon must be > 0");
+  return PyNorm{dims, rlprim::RunningNorm(dim, epsilon)};
+}
+
+// Rows in `a`, which holds either one item of `shape` or a batch of them.
+std::size_t norm_rows(const py::array& a, const std::vector<py::ssize_t>& shape) {
+  const auto nd = static_cast<py::ssize_t>(shape.size());
+  const py::ssize_t off = a.ndim() - nd;
+  bool ok = off == 0 || off == 1;
+  for (py::ssize_t i = 0; ok && i < nd; ++i) ok = a.shape(i + off) == shape[static_cast<std::size_t>(i)];
+  if (!ok) throw py::value_error("x must have the normalizer's shape, or a batch of it");
+  return off == 1 ? static_cast<std::size_t>(a.shape(0)) : 1;
+}
+
+template <class T>
+void norm_update(PyNorm& n, const py::object& x) {
+  auto a = as_array<T>(x, "x");
+  const std::size_t rows = norm_rows(a, n.shape);
+  py::gil_scoped_release release;
+  n.core.update<T>(a.data(), rows);
+}
+
+template <class T>
+py::array norm_apply(const PyNorm& n, const py::object& x, double clip) {
+  auto a = as_array<T>(x, "x");
+  const std::size_t rows = norm_rows(a, n.shape);
+  auto out = like<T>(a);
+  {
+    py::gil_scoped_release release;
+    n.core.normalize<T>(a.data(), rows, out.mutable_data(), clip);
+  }
+  return std::move(out);
+}
+
+py::array_t<double> norm_stat(const PyNorm& n, const std::vector<double>& v) {
+  py::array_t<double> out(n.shape);
+  std::copy(v.begin(), v.end(), out.mutable_data());
+  return out;
+}
+
 void check_index(std::int64_t i, std::size_t capacity) {
   if (i < 0 || static_cast<std::size_t>(i) >= capacity)
     throw py::index_error("index " + std::to_string(i) + " is out of range");
@@ -256,6 +315,29 @@ PYBIND11_MODULE(_core, m) {
       "Retrace(lambda) Q targets.\n\n"
       "q_values[t] = Q(s_t, a_t), values[t] = E_pi Q(s_t, .), last_value = E_pi Q of the\n"
       "state after the final step, log_rhos = log pi(a|s) - log mu(a|s).");
+
+  py::class_<PyNorm>(m, "RunningNorm",
+                     "Running mean and variance per feature, for observation or reward normalization.\n\n"
+                     "Same update rule and starting state as Gymnasium's RunningMeanStd.")
+      .def(py::init(&make_norm), py::arg("shape"), py::arg("epsilon") = 1e-4)
+      .def_property_readonly("count", [](const PyNorm& n) { return n.core.count(); })
+      .def_property_readonly("mean", [](const PyNorm& n) { return norm_stat(n, n.core.mean()); })
+      .def_property_readonly("var", [](const PyNorm& n) { return norm_stat(n, n.core.var()); })
+      .def(
+          "update",
+          [](PyNorm& n, const py::object& x) {
+            if (is_float32(x)) norm_update<float>(n, x);
+            else norm_update<double>(n, x);
+          },
+          py::arg("x"), "Fold in one item or a batch of items.")
+      .def(
+          "normalize",
+          [](const PyNorm& n, const py::object& x, double clip) {
+            if (!(clip > 0.0)) throw py::value_error("clip must be > 0");
+            return is_float32(x) ? norm_apply<float>(n, x, clip) : norm_apply<double>(n, x, clip);
+          },
+          py::arg("x"), py::arg("clip") = 10.0,
+          "clip((x - mean) / sqrt(var + 1e-8), -clip, clip), same shape and float type as x.");
 
   py::class_<rlprim::SumTree>(m, "SumTree",
                               "Sum tree over non-negative weights with O(log n) update and lookup.")

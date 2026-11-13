@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -19,6 +20,74 @@
 #endif
 
 namespace rlprim {
+
+namespace detail {
+
+// exp() written so a compiler can vectorize the loop around it, which it can't
+// do with a call into libm. Range reduction x = k ln2 + r, a Taylor polynomial
+// for e^r, then 2^k built straight from the exponent bits. Matches std::exp to
+// a few ulp (the smoke test checks it). The input is clamped so the result
+// stays a normal number: exp(-700) is as good as zero for an importance ratio.
+inline double exp_fast(double x) noexcept {
+  constexpr double kLo = -700.0, kHi = 700.0;
+  constexpr double kInvLn2 = 1.44269504088896338700e+00;
+  constexpr double kLn2Hi = 6.93147180369123816490e-01;
+  constexpr double kLn2Lo = 1.90821492927058770002e-10;
+  constexpr double kRound = 6755399441055744.0;  // 1.5 * 2^52: adding it rounds to an integer
+  x = x < kLo ? kLo : (x > kHi ? kHi : x);
+  const double shifted = x * kInvLn2 + kRound;
+  const double k = shifted - kRound;
+  const double r = (x - k * kLn2Hi) - k * kLn2Lo;
+  double p = 1.0 / 6227020800.0;
+  p = p * r + 1.0 / 479001600.0;
+  p = p * r + 1.0 / 39916800.0;
+  p = p * r + 1.0 / 3628800.0;
+  p = p * r + 1.0 / 362880.0;
+  p = p * r + 1.0 / 40320.0;
+  p = p * r + 1.0 / 5040.0;
+  p = p * r + 1.0 / 720.0;
+  p = p * r + 1.0 / 120.0;
+  p = p * r + 1.0 / 24.0;
+  p = p * r + 1.0 / 6.0;
+  p = p * r + 0.5;
+  p = p * r + 1.0;
+  p = p * r + 1.0;
+  // the low bits of `shifted` hold k as an integer
+  std::uint64_t bits;
+  std::memcpy(&bits, &shifted, sizeof bits);
+  bits = (bits + 1023u) << 52;
+  double scale;
+  std::memcpy(&scale, &bits, sizeof scale);
+  return p * scale;
+}
+
+inline float exp_fast(float x) noexcept {
+  constexpr float kLo = -87.0f, kHi = 88.0f;
+  constexpr float kInvLn2 = 1.44269504088896341f;
+  constexpr float kLn2Hi = 0.693359375f;
+  constexpr float kLn2Lo = -2.12194440e-4f;
+  constexpr float kRound = 12582912.0f;  // 1.5 * 2^23
+  x = x < kLo ? kLo : (x > kHi ? kHi : x);
+  const float shifted = x * kInvLn2 + kRound;
+  const float k = shifted - kRound;
+  const float r = (x - k * kLn2Hi) - k * kLn2Lo;
+  float p = 1.0f / 5040.0f;
+  p = p * r + 1.0f / 720.0f;
+  p = p * r + 1.0f / 120.0f;
+  p = p * r + 1.0f / 24.0f;
+  p = p * r + 1.0f / 6.0f;
+  p = p * r + 0.5f;
+  p = p * r + 1.0f;
+  p = p * r + 1.0f;
+  std::uint32_t bits;
+  std::memcpy(&bits, &shifted, sizeof bits);
+  bits = (bits + 127u) << 23;
+  float scale;
+  std::memcpy(&scale, &bits, sizeof scale);
+  return p * scale;
+}
+
+}  // namespace detail
 
 // Generalized Advantage Estimation (Schulman et al. 2016).
 // Writes advantages and returns (advantage + value). One backward pass.
@@ -78,52 +147,67 @@ void discounted_returns(const T* RLPRIM_RESTRICT rewards, const std::uint8_t* RL
 // where k is n, shortened by an episode end (no bootstrap then) or by the end
 // of the rollout (bootstrap from last_values).
 //
-// Runs in O(steps * envs), not O(steps * envs * n): each env's window sum
-// slides backward and drops one reward when it grows past n. The running sum is kept in
-// double so the subtraction doesn't drift for float32 inputs.
+// Cost is O(steps * envs) whatever n is. One backward pass keeps the plain
+// discounted return-to-go R_t for the last n + 1 rows, and uses
+//   sum of the window = R_t - gamma^k R_{t+k}
+// For a given row k is the same for every env, so the inner loop touches whole
+// rows with no per-element lookups and the compiler can vectorize it. R is
+// kept in double so float32 rollouts don't lose digits in the subtraction.
 template <class T>
-void nstep_returns(const T* rewards, const T* values, const std::uint8_t* dones,
-                   const T* last_values, std::size_t steps, std::size_t envs, std::size_t n,
-                   T gamma, T* out) {
-  if (n == 0 || steps == 0) return;
+void nstep_returns(const T* RLPRIM_RESTRICT rewards, const T* RLPRIM_RESTRICT values,
+                   const std::uint8_t* RLPRIM_RESTRICT dones,
+                   const T* RLPRIM_RESTRICT last_values, std::size_t steps, std::size_t envs,
+                   std::size_t n, T gamma, T* RLPRIM_RESTRICT out) {
+  if (n == 0 || steps == 0 || envs == 0) return;
+  if (n > steps) n = steps;
   const double g = static_cast<double>(gamma);
   std::vector<double> gpow(n + 1);
   gpow[0] = 1.0;
   for (std::size_t k = 1; k <= n; ++k) gpow[k] = gpow[k - 1] * g;
 
-  // Per-env window state, walked row by row so memory access stays sequential.
-  // The inner loop is branch-free: each of the three cases (episode end,
-  // window full, window still growing) is picked with selects.
-  std::vector<double> window_buf(envs, 0.0);     // discounted reward sum over [t, end)
-  std::vector<std::size_t> end_buf(envs, steps);  // exclusive end of the window
-  std::vector<double> open_buf(envs, 1.0);        // 0 when the window stops at an episode end
-  double* RLPRIM_RESTRICT window = window_buf.data();
-  std::size_t* RLPRIM_RESTRICT end = end_buf.data();
-  double* RLPRIM_RESTRICT open = open_buf.data();
-  const double* RLPRIM_RESTRICT gp = gpow.data();
-  const double gdrop = gpow[n - 1];
+  const std::size_t ring_rows = n + 1;
+  std::vector<double> ring(ring_rows * envs);  // R for rows t .. t + n
+  const std::vector<double> zeros(envs, 0.0);  // R past the end of the rollout
+  // steps until the next episode end, counting that step. Saturates when there is none.
+  constexpr std::uint32_t kNever = 0x7fffffffu;
+  std::vector<std::uint32_t> dist_buf(envs, kNever);
+  std::uint32_t* RLPRIM_RESTRICT dist = dist_buf.data();
 
   for (std::size_t t = steps; t-- > 0;) {
-    const T* r = rewards + t * envs;
-    const std::uint8_t* d = dones + t * envs;
-    // when t + n is past the rollout no window can be full, so any valid row works
-    const T* dropped = (t + n < steps) ? rewards + (t + n) * envs : r;
-    T* o = out + t * envs;
+    const std::size_t k = (steps - t < n) ? steps - t : n;  // window length without a done
+    const bool at_end = (t + k == steps);
+    const double gk = gpow[k];
+    const auto k32 = static_cast<std::uint32_t>(k);
+    const T* RLPRIM_RESTRICT r = rewards + t * envs;
+    const std::uint8_t* RLPRIM_RESTRICT d = dones + t * envs;
+    const T* RLPRIM_RESTRICT boot = at_end ? last_values : values + (t + k) * envs;
+    double* RLPRIM_RESTRICT cur = ring.data() + (t % ring_rows) * envs;
+    const double* RLPRIM_RESTRICT next =
+        (t + 1 == steps) ? zeros.data() : ring.data() + ((t + 1) % ring_rows) * envs;
+    const double* RLPRIM_RESTRICT far =
+        at_end ? zeros.data() : ring.data() + ((t + k) % ring_rows) * envs;
+    T* RLPRIM_RESTRICT o = out + t * envs;
+
+    if (k == 1) {
+      // next and far are the same row here, so read it once
+      for (std::size_t e = 0; e < envs; ++e) {
+        const bool done = d[e] != 0;
+        const double nx = next[e];
+        const double ret = static_cast<double>(r[e]) + (done ? 0.0 : g * nx);
+        dist[e] = done ? 1u : dist[e] + (dist[e] < kNever ? 1u : 0u);
+        cur[e] = ret;
+        o[e] = static_cast<T>(ret + (done ? 0.0 : gk * (static_cast<double>(boot[e]) - nx)));
+      }
+      continue;
+    }
     for (std::size_t e = 0; e < envs; ++e) {
       const bool done = d[e] != 0;
-      const std::size_t en = end[e];
-      const bool full = !done && (en - t > n);
-      const double re = static_cast<double>(r[e]);
-      const double sub = full ? gdrop * static_cast<double>(dropped[e]) : 0.0;
-      const double w = re + (done ? 0.0 : g) * (window[e] - sub);
-      const std::size_t en2 = done ? t + 1 : (full ? t + n : en);
-      const double op = done ? 0.0 : (full ? 1.0 : open[e]);
-      window[e] = w;
-      end[e] = en2;
-      open[e] = op;
-      const double boot = (en2 == steps) ? static_cast<double>(last_values[e])
-                                         : static_cast<double>(values[en2 * envs + e]);
-      o[e] = static_cast<T>(w + op * gp[en2 - t] * boot);
+      const double ret = static_cast<double>(r[e]) + (done ? 0.0 : g * next[e]);
+      const std::uint32_t ds = done ? 1u : dist[e] + (dist[e] < kNever ? 1u : 0u);
+      dist[e] = ds;
+      cur[e] = ret;
+      const double tail = gk * (static_cast<double>(boot[e]) - far[e]);
+      o[e] = static_cast<T>(ret + (ds <= k32 ? 0.0 : tail));
     }
   }
 }
@@ -140,20 +224,26 @@ void vtrace(const T* RLPRIM_RESTRICT log_rhos, const T* RLPRIM_RESTRICT rewards,
             T* RLPRIM_RESTRICT pg_advantages) {
   for (std::size_t t = steps; t-- > 0;) {
     const bool last = (t + 1 == steps);
-    const T* next_v = last ? last_values : values + (t + 1) * envs;
-    const T* next_vs = last ? last_values : vs + (t + 1) * envs;
-    const std::size_t row = t * envs;
+    // every pointer below is a different row, so they can't overlap
+    const T* RLPRIM_RESTRICT next_v = last ? last_values : values + (t + 1) * envs;
+    const T* RLPRIM_RESTRICT next_vs = last ? last_values : vs + (t + 1) * envs;
+    const T* RLPRIM_RESTRICT lr = log_rhos + t * envs;
+    const T* RLPRIM_RESTRICT r = rewards + t * envs;
+    const T* RLPRIM_RESTRICT v = values + t * envs;
+    const std::uint8_t* RLPRIM_RESTRICT d = dones + t * envs;
+    T* RLPRIM_RESTRICT out_vs = vs + t * envs;
+    T* RLPRIM_RESTRICT out_pg = pg_advantages + t * envs;
     for (std::size_t e = 0; e < envs; ++e) {
-      const T rho_raw = std::exp(log_rhos[row + e]);
+      const T rho_raw = detail::exp_fast(lr[e]);
       const T rho = rho_raw < clip_rho ? rho_raw : clip_rho;
       const T c = lam * (rho_raw < clip_c ? rho_raw : clip_c);
       const T rho_pg = rho_raw < clip_pg_rho ? rho_raw : clip_pg_rho;
-      const T disc = dones[row + e] ? T(0) : gamma;
-      const T r = rewards[row + e];
-      const T v = values[row + e];
-      const T delta = rho * (r + disc * next_v[e] - v);
-      vs[row + e] = v + delta + disc * c * (next_vs[e] - next_v[e]);
-      pg_advantages[row + e] = rho_pg * (r + disc * next_vs[e] - v);
+      const T disc = d[e] ? T(0) : gamma;
+      const T nv = next_v[e];
+      const T nvs = next_vs[e];
+      const T base = r[e] - v[e];
+      out_vs[e] = v[e] + rho * (base + disc * nv) + disc * c * (nvs - nv);
+      out_pg[e] = rho_pg * (base + disc * nvs);
     }
   }
 }
@@ -176,12 +266,18 @@ void retrace(const T* RLPRIM_RESTRICT rewards, const T* RLPRIM_RESTRICT q_values
       }
       continue;
     }
-    const std::size_t nxt = row + envs;
+    const T* RLPRIM_RESTRICT r = rewards + row;
+    const std::uint8_t* RLPRIM_RESTRICT d = dones + row;
+    const T* RLPRIM_RESTRICT nv = values + row + envs;
+    const T* RLPRIM_RESTRICT nq = q_values + row + envs;
+    const T* RLPRIM_RESTRICT nlr = log_rhos + row + envs;
+    const T* RLPRIM_RESTRICT nout = out + row + envs;
+    T* RLPRIM_RESTRICT o = out + row;
     for (std::size_t e = 0; e < envs; ++e) {
-      const T rho = std::exp(log_rhos[nxt + e]);
+      const T rho = detail::exp_fast(nlr[e]);
       const T c = lam * (rho < T(1) ? rho : T(1));
-      const T disc = dones[row + e] ? T(0) : gamma;
-      out[row + e] = rewards[row + e] + disc * (values[nxt + e] + c * (out[nxt + e] - q_values[nxt + e]));
+      const T disc = d[e] ? T(0) : gamma;
+      o[e] = r[e] + disc * (nv[e] + c * (nout[e] - nq[e]));
     }
   }
 }

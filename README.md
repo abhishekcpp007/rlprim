@@ -15,6 +15,7 @@ Most RL codebases carry their own copy of the same few functions: a GAE loop, an
 | `retrace` | Retrace(lambda) Q targets for off-policy learning |
 | `SumTree` | Sum tree with O(log n) update and prefix lookup |
 | `PrioritizedSampler` | Proportional prioritized replay sampling with importance weights |
+| `RunningNorm` | Running mean and variance for observation or reward normalization |
 
 ## Install
 
@@ -44,6 +45,11 @@ sampler = rlprim.PrioritizedSampler(capacity=1_000_000, alpha=0.6, seed=0)
 sampler.update(new_slots, sampler.max_priority)       # fresh transitions
 idx, weights = sampler.sample(batch_size=256, beta=0.4)
 sampler.update(idx, np.abs(td_errors) + 1e-6)         # after the learner step
+
+# observation normalization, same math as Gymnasium's RunningMeanStd
+norm = rlprim.RunningNorm(obs_shape)
+norm.update(obs_batch)
+obs_batch = norm.normalize(obs_batch, clip=10.0)
 ```
 
 `dones[t]` means the episode ended at step t. `last_value` is the value of the state after the final step, either a scalar or one entry per env. float32 rewards give float32 results and everything else gives float64.
@@ -83,35 +89,44 @@ Measured on an Apple Silicon Mac (arm64, Python 3.12, NumPy 2.5), best of 7 runs
 
 | Task | Baseline | Baseline time | rlprim | Speedup |
 |---|---|---:|---:|---:|
-| GAE, 2048 steps x 1 env | NumPy loop over steps | 7.73 ms | 8.2 us | 941x |
-| GAE, 2048 steps x 8 envs | NumPy loop over steps | 7.80 ms | 11.2 us | 696x |
-| GAE, 128 steps x 64 envs | NumPy loop over steps | 484.8 us | 3.0 us | 162x |
-| GAE, 128 steps x 4096 envs | NumPy loop over steps | 1.13 ms | 158.5 us | 7.1x |
-| 3-step returns, 2048 x 8 | NumPy, n array passes | 372.0 us | 28.9 us | 13x |
-| 20-step returns, 2048 x 8 | NumPy, n array passes | 2.07 ms | 29.2 us | 71x |
-| PER sample, batch 256, 100k slots | pure-Python sum tree | 844.5 us | 21.2 us | 40x |
-| PER update, batch 256, 100k slots | pure-Python sum tree | 734.2 us | 21.2 us | 35x |
-| PER sample, batch 256, 100k slots | `rng.choice(p=...)` | 939.2 us | 21.2 us | 44x |
-| PER sample, batch 256, 1M slots | `rng.choice(p=...)` | 9.09 ms | 28.1 us | 324x |
+| GAE, 2048 steps x 1 env | NumPy loop over steps | 7.31 ms | 8.1 us | 905x |
+| GAE, 2048 steps x 8 envs | NumPy loop over steps | 7.67 ms | 11.7 us | 654x |
+| GAE, 128 steps x 64 envs | NumPy loop over steps | 460.9 us | 2.8 us | 167x |
+| GAE, 128 steps x 4096 envs | NumPy loop over steps | 1.03 ms | 137.1 us | 7.5x |
+| 3-step returns, 2048 x 8 | NumPy, n array passes | 343.3 us | 23.8 us | 14x |
+| 20-step returns, 2048 x 8 | NumPy, n array passes | 1.92 ms | 23.8 us | 80x |
+| 3-step returns, 128 x 4096 | NumPy, n array passes | 5.38 ms | 642.5 us | 8.4x |
+| V-trace, 2048 x 8 | NumPy loop over steps | 2.43 ms | 18.7 us | 129x |
+| Retrace, 2048 x 8 | NumPy loop over steps | 3.99 ms | 19.7 us | 202x |
+| V-trace, 128 x 4096 | NumPy loop over steps | 2.35 ms | 531.9 us | 4.4x |
+| Retrace, 128 x 4096 | NumPy loop over steps | 1.78 ms | 519.0 us | 3.4x |
+| Normalizer update + apply, 8 x 64 | NumPy RunningMeanStd | 20.5 us | 1.0 us | 22x |
+| Normalizer update + apply, 4096 x 64 | NumPy RunningMeanStd | 714.9 us | 113.6 us | 6.3x |
+| PER sample, batch 256, 100k slots | pure-Python sum tree | 718.7 us | 19.9 us | 36x |
+| PER update, batch 256, 100k slots | pure-Python sum tree | 568.6 us | 19.3 us | 29x |
+| PER sample, batch 256, 100k slots | `rng.choice(p=...)` | 847.6 us | 19.9 us | 43x |
+| PER sample, batch 256, 1M slots | `rng.choice(p=...)` | 7.86 ms | 24.4 us | 323x |
 
-Read these honestly. The GAE baseline is the per-step NumPy loop from typical PPO code, so the gap is biggest when you have few envs and Python overhead dominates. With thousands of envs NumPy is already doing real work per step and the gap shrinks to single digits. No GPU baseline is included yet, and V-trace and Retrace have no benchmark yet. Timings move by 10 to 30 percent between runs on a laptop.
+Read these honestly. Every baseline is the per-step NumPy loop from typical training code, so the gap is biggest when you have few envs and Python overhead dominates. With thousands of envs NumPy is already doing real work per step and the gap shrinks to single digits. The V-trace and Retrace rows use float32. With float64 they run about 3x slower than that, because the exp inside them vectorizes less well. No GPU baseline is included yet. Timings move by 10 to 30 percent between runs on a laptop.
 
 ### Sampling cost by buffer size
 
 Lookups walk the tree in groups of 16 and prefetch each one's next node, so the cache misses of a big tree overlap. Same machine, `python bench/bench_sample.py`, time per `sample()` call:
 
-| Slots | Batch | One lookup at a time | Grouped with prefetch |
+| Slots | Batch | Time per call | Per sample |
 |---:|---:|---:|---:|
-| 100,000 | 256 | 29.6 us | 20.9 us |
-| 100,000 | 4096 | 336.4 us | 245.6 us |
-| 1,000,000 | 256 | 58.0 us | 26.8 us |
-| 1,000,000 | 4096 | 695.5 us | 363.2 us |
-| 10,000,000 | 256 | 87.6 us | 38.3 us |
-| 10,000,000 | 4096 | 1151.6 us | 549.9 us |
+| 100,000 | 256 | 19.2 us | 75 ns |
+| 100,000 | 4096 | 229.9 us | 56 ns |
+| 1,000,000 | 256 | 25.0 us | 97 ns |
+| 1,000,000 | 4096 | 305.3 us | 75 ns |
+| 10,000,000 | 256 | 33.2 us | 130 ns |
+| 10,000,000 | 4096 | 438.2 us | 107 ns |
+
+Before the grouped walk the 10M-slot rows took 87.6 us and 1151.6 us.
 
 ## How it's tested
 
-Every function is compared against a slow brute-force version on random inputs, including rollouts where every step is a done and rollouts with none. The sum tree is checked against `cumsum` plus `searchsorted`. Sampling frequencies are checked against `priority ** alpha`. A separate C++ smoke test builds the headers with no Python involved.
+Every function is compared against a slow brute-force version on random inputs, including rollouts where every step is a done and rollouts with none. The sum tree is checked against `cumsum` plus `searchsorted`, and the normalizer against the Gymnasium formula. Sampling frequencies are checked against `priority ** alpha`. A separate C++ smoke test builds the headers with no Python involved.
 
 ```bash
 pip install ".[test]" && pytest
@@ -122,15 +137,17 @@ cmake -S . -B build -DRLPRIM_BUILD_TESTS=ON && cmake --build build && ctest --te
 
 - The sum tree recomputes each parent from its two children on update. Trees that push a delta up to the root pile up rounding error over many updates, and this one doesn't.
 - `find` never returns an empty slot, even when rounding pushes the lookup past the last filled leaf.
-- `nstep_returns` slides one window backward per env and walks memory row by row. It keeps the running sum in double so float32 rollouts don't pick up error from the subtraction.
+- `nstep_returns` keeps the discounted return-to-go for the last n + 1 rows and gets each window as a difference of two of them. The window length is the same across a row, so the inner loop has no per-element lookups and it vectorizes. The running values are kept in double so float32 rollouts don't lose digits in the subtraction.
+- V-trace and Retrace use their own `exp`, written so the compiler can vectorize the loop around it. The C++ test checks it against `std::exp`: the worst relative error is 2.2e-16 for double and 7.1e-8 for float.
 - The GIL is released inside the return estimators.
 - V-trace and Retrace take log importance ratios, the form your policy network already gives you.
 
 ## Roadmap
 
 - Segment-tree min/max queries exposed in Python
-- Vectorized frame stacking and observation normalization
-- Benchmarks for V-trace and Retrace, plus a GPU baseline
+- Vectorized frame stacking
+- A GPU baseline in the benchmarks
+- Faster float64 V-trace and Retrace
 - Prebuilt wheels on PyPI
 
 ## License

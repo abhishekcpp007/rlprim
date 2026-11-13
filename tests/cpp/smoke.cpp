@@ -49,6 +49,27 @@ int main() {
     CHECK(near(pg[0], 1.0 + 0.5 * vs[1] - 0.3));
   }
 
+  // the vectorizable exp stays within a few ulp of std::exp
+  {
+    double worst64 = 0.0, worst32 = 0.0;
+    for (int i = -70000; i <= 70000; ++i) {
+      const double x = i * 0.00997;
+      const double want = std::exp(x);
+      worst64 = std::fmax(worst64, std::fabs(rlprim::detail::exp_fast(x) - want) / want);
+      if (x > -80.0 && x < 80.0) {
+        const float xf = static_cast<float>(x);
+        const double wantf = std::exp(static_cast<double>(xf));
+        worst32 = std::fmax(worst32, std::fabs(rlprim::detail::exp_fast(xf) - wantf) / wantf);
+      }
+    }
+    std::printf("exp_fast worst relative error: double %.2e, float %.2e\n", worst64, worst32);
+    CHECK(worst64 < 1e-15);
+    CHECK(worst32 < 5e-7);
+    CHECK(rlprim::detail::exp_fast(0.0) == 1.0 && rlprim::detail::exp_fast(0.0f) == 1.0f);
+    CHECK(rlprim::detail::exp_fast(-1e9) > 0.0 && rlprim::detail::exp_fast(-1e9) < 1e-300);
+    CHECK(std::isfinite(rlprim::detail::exp_fast(1e9)) && rlprim::detail::exp_fast(1e9) > 1e300);
+  }
+
   // GAE on one env, episode ends at step 1
   const std::vector<double> r = {1.0, 2.0, 3.0};
   const std::vector<double> v = {0.5, 0.25, 1.0};

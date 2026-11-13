@@ -5,6 +5,7 @@ C++ core, NumPy in and out.
 
 from ._core import (
     PrioritizedSampler,
+    RunningNorm,
     SumTree,
     discounted_returns,
     gae,
@@ -17,6 +18,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "PrioritizedSampler",
+    "RunningNorm",
     "SumTree",
     "discounted_returns",
     "gae",

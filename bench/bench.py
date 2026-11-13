@@ -72,6 +72,54 @@ def numpy_nstep(r, v, d, last, n, gamma=0.99):
     return out
 
 
+def numpy_vtrace(lr, r, v, d, last, gamma=0.99):
+    """Backward loop over steps, vectorized over envs, as in the IMPALA reference code."""
+    steps = r.shape[0]
+    rho_raw = np.exp(lr)
+    rho = np.minimum(1.0, rho_raw)
+    disc = gamma * (1.0 - d)
+    vnext = np.concatenate([v[1:], last[None]], axis=0)
+    delta = rho * (r + disc * vnext - v)
+    acc = np.zeros_like(last)
+    diff = np.zeros_like(r)
+    for t in reversed(range(steps)):
+        diff[t] = acc = delta[t] + disc[t] * rho[t] * acc
+    vs = v + diff
+    vs_next = np.concatenate([vs[1:], last[None]], axis=0)
+    return vs, rho * (r + disc * vs_next - v)
+
+
+def numpy_retrace(r, q, v, lr, d, last, gamma=0.99):
+    steps = r.shape[0]
+    c = np.minimum(1.0, np.exp(lr))
+    disc = gamma * (1.0 - d)
+    out = np.zeros_like(r)
+    out[-1] = r[-1] + disc[-1] * last
+    for t in reversed(range(steps - 1)):
+        out[t] = r[t] + disc[t] * (v[t + 1] + c[t + 1] * (out[t + 1] - q[t + 1]))
+    return out
+
+
+class NumpyRunningMeanStd:
+    """The Gymnasium / Stable-Baselines3 normalizer."""
+
+    def __init__(self, shape, epsilon=1e-4):
+        self.mean = np.zeros(shape, np.float64)
+        self.var = np.ones(shape, np.float64)
+        self.count = epsilon
+
+    def update(self, x):
+        bm, bv, bc = x.mean(axis=0), x.var(axis=0), x.shape[0]
+        delta = bm - self.mean
+        tot = self.count + bc
+        new_mean = self.mean + delta * bc / tot
+        m2 = self.var * self.count + bv * bc + np.square(delta) * self.count * bc / tot
+        self.mean, self.var, self.count = new_mean, m2 / tot, tot
+
+    def normalize(self, x, clip=10.0):
+        return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8), -clip, clip)
+
+
 class PySumTree:
     """The pure-Python sum tree found in most PER tutorials."""
 
@@ -125,17 +173,17 @@ def bench_gae(rows):
 
 def bench_nstep(rows):
     rng = np.random.default_rng(1)
-    steps, envs = 2048, 8
-    r = rng.normal(size=(steps, envs))
-    v = rng.normal(size=(steps, envs))
-    d = (rng.random((steps, envs)) < 0.01)
-    df = d.astype(np.float64)
-    last = rng.normal(size=envs)
-    for n in [3, 20]:
-        assert np.allclose(rlprim.nstep_returns(r, v, d, last, n=n), numpy_nstep(r, v, df, last, n))
-        base = best(lambda: numpy_nstep(r, v, df, last, n))
-        ours = best(lambda: rlprim.nstep_returns(r, v, d, last, n=n))
-        rows.append((f"{n}-step returns, {steps} steps x {envs} envs", "NumPy, n array passes", base, ours))
+    for steps, envs, ns in [(2048, 8, [3, 20]), (128, 4096, [3])]:
+        r = rng.normal(size=(steps, envs))
+        v = rng.normal(size=(steps, envs))
+        d = (rng.random((steps, envs)) < 0.01)
+        df = d.astype(np.float64)
+        last = rng.normal(size=envs)
+        for n in ns:
+            assert np.allclose(rlprim.nstep_returns(r, v, d, last, n=n), numpy_nstep(r, v, df, last, n))
+            base = best(lambda: numpy_nstep(r, v, df, last, n))
+            ours = best(lambda: rlprim.nstep_returns(r, v, d, last, n=n))
+            rows.append((f"{n}-step returns, {steps} steps x {envs} envs", "NumPy, n array passes", base, ours))
 
 
 def bench_sampler(rows):
@@ -171,10 +219,53 @@ def bench_sampler(rows):
             rows.append((f"PER update, batch {batch}, {capacity:,} slots", "pure-Python sum tree", t_py_up, t_ours_up))
 
 
+def bench_offpolicy(rows):
+    rng = np.random.default_rng(3)
+    for steps, envs in [(2048, 8), (128, 4096)]:
+        f = np.float32
+        r = rng.normal(size=(steps, envs)).astype(f)
+        v = rng.normal(size=(steps, envs)).astype(f)
+        q = rng.normal(size=(steps, envs)).astype(f)
+        lr = (0.5 * rng.normal(size=(steps, envs))).astype(f)
+        d = rng.random((steps, envs)) < 0.01
+        df = d.astype(f)
+        last = rng.normal(size=envs).astype(f)
+        assert np.allclose(rlprim.vtrace(lr, r, v, d, last)[0], numpy_vtrace(lr, r, v, df, last)[0], atol=1e-2)
+        assert np.allclose(rlprim.retrace(r, q, v, lr, d, last), numpy_retrace(r, q, v, lr, df, last), atol=1e-2)
+        base = best(lambda: numpy_vtrace(lr, r, v, df, last))
+        ours = best(lambda: rlprim.vtrace(lr, r, v, d, last))
+        rows.append((f"V-trace, {steps} steps x {envs} envs", "NumPy loop over steps", base, ours))
+        base = best(lambda: numpy_retrace(r, q, v, lr, df, last))
+        ours = best(lambda: rlprim.retrace(r, q, v, lr, d, last))
+        rows.append((f"Retrace, {steps} steps x {envs} envs", "NumPy loop over steps", base, ours))
+
+
+def bench_norm(rows):
+    rng = np.random.default_rng(4)
+    for batch, dim in [(8, 64), (4096, 64)]:
+        x = rng.normal(size=(batch, dim)).astype(np.float32)
+        ours, ref = rlprim.RunningNorm(dim), NumpyRunningMeanStd(dim)
+        ours.update(x)
+        ref.update(x)
+        assert np.allclose(ours.normalize(x), ref.normalize(x), atol=1e-4)
+
+        def ref_step():
+            ref.update(x)
+            ref.normalize(x)
+
+        def our_step():
+            ours.update(x)
+            ours.normalize(x)
+
+        rows.append((f"Normalizer update + apply, {batch} x {dim}", "NumPy RunningMeanStd", best(ref_step), best(our_step)))
+
+
 def main():
     rows = []
     bench_gae(rows)
     bench_nstep(rows)
+    bench_offpolicy(rows)
+    bench_norm(rows)
     bench_sampler(rows)
     print(f"{platform.machine()}, {platform.system()}, Python {platform.python_version()}, NumPy {np.__version__}\n")
     print("| Task | Baseline | Baseline time | rlprim | Speedup |")
